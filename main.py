@@ -17,32 +17,11 @@ from threading import Thread
 from gtts import gTTS
 import subprocess
 
-# Load environment variables
+# ==================== LOAD ENVIRONMENT ====================
 try:
     load_dotenv()
 except:
     pass
-
-# ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-
-# Configure Gemini with better model
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Use gemini-1.5-flash (faster, better limits, cheaper)
-    # Fallback to gemini-pro if flash isn't available
-    try:
-        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-        # Test if model works
-        test_response = gemini_model.generate_content("test")
-        logger.info("✅ Using Gemini 1.5 Flash (faster, better limits)")
-    except Exception as e:
-        logger.warning(f"Gemini 1.5 Flash not available, falling back to gemini-pro: {e}")
-        gemini_model = genai.GenerativeModel('gemini-pro')
-        logger.info("✅ Using Gemini Pro")
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -50,6 +29,50 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ==================== CONFIGURATION ====================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+
+# ==================== GEMINI 2.0 FLASH LITE ====================
+gemini_model = None
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # Try Gemini 2.0 Flash Lite first (fastest, best free tier)
+        model_names = [
+            'gemini-2.0-flash-lite',    # Fastest, best limits
+            'gemini-2.0-flash-lite-preview-02-05',  # Preview version
+            'gemini-2.0-flash',         # Regular flash
+            'gemini-1.5-flash',         # Stable fallback
+            'gemini-pro'                # Legacy fallback
+        ]
+        
+        for model_name in model_names:
+            try:
+                logger.info(f"🔄 Trying Gemini model: {model_name}")
+                test_model = genai.GenerativeModel(model_name)
+                # Quick test
+                test_response = test_model.generate_content("test")
+                if test_response and test_response.text is not None:
+                    gemini_model = test_model
+                    logger.info(f"✅ Using Gemini model: {model_name}")
+                    break
+            except Exception as e:
+                logger.warning(f"❌ Model {model_name} failed: {str(e)[:50]}")
+                continue
+        
+        if gemini_model is None:
+            logger.error("❌ No Gemini model available!")
+            
+    except Exception as e:
+        logger.error(f"❌ Gemini configuration error: {e}")
+else:
+    logger.warning("⚠️ GEMINI_API_KEY not set!")
 
 # ==================== FLASK WEB SERVER ====================
 app = Flask('')
@@ -97,6 +120,7 @@ IELTS_ANGER_PROMPT = """### CORE PERSONALITY TRAITS
 async def transcribe_deepgram(audio_path: str):
     """Transcribe using Deepgram"""
     if not DEEPGRAM_API_KEY:
+        logger.error("❌ DEEPGRAM_API_KEY not set!")
         return None, None
     
     try:
@@ -114,6 +138,7 @@ async def transcribe_deepgram(audio_path: str):
             "smart_format": "true"
         }
         
+        logger.info("🎤 Sending audio to Deepgram...")
         response = requests.post(
             url,
             headers=headers,
@@ -128,21 +153,22 @@ async def transcribe_deepgram(audio_path: str):
             detected_lang = data["results"]["channels"][0].get("detected_language", "en")
             
             lang_map = {"ru": "ru", "uz": "uz", "en": "en"}
+            logger.info(f"✅ Deepgram transcribed: {transcript[:50]}...")
             return transcript, lang_map.get(detected_lang, "en")
         else:
-            logger.error(f"Deepgram error: {response.status_code} - {response.text}")
+            logger.error(f"❌ Deepgram error: {response.status_code} - {response.text}")
             return None, None
     except Exception as e:
-        logger.error(f"Deepgram error: {e}")
+        logger.error(f"❌ Deepgram error: {e}")
         return None, None
 
 async def transcribe_audio(audio_path: str):
     """Transcribe using Deepgram"""
     result = await transcribe_deepgram(audio_path)
     if result and result[0]:
-        logger.info(f"✅ Transcribed with Deepgram")
         return result
     
+    logger.error("❌ All transcription methods failed!")
     return None, None
 
 # ==================== TTS FUNCTIONS ====================
@@ -183,6 +209,7 @@ async def generate_voice_reply(text: str, lang: str):
             logger.info(f"✅ Voice file created: {ogg_path}")
             return ogg_path
         else:
+            logger.error("❌ FFmpeg conversion failed")
             return None
             
     except Exception as e:
@@ -191,8 +218,13 @@ async def generate_voice_reply(text: str, lang: str):
 
 # ==================== LLM FUNCTIONS ====================
 async def get_llm_response_gemini(text: str, lang: str = "en"):
-    """Get response from Gemini with automatic model fallback"""
+    """Get response from Gemini"""
     if not GEMINI_API_KEY:
+        logger.error("❌ GEMINI_API_KEY not set!")
+        return None
+    
+    if gemini_model is None:
+        logger.error("❌ No Gemini model available!")
         return None
     
     try:
@@ -206,24 +238,13 @@ Respond in {lang} language with the same angry, savage energy. Keep it SHORT (2-
         response = gemini_model.generate_content(full_prompt)
         
         if response and response.text:
+            logger.info(f"✅ Gemini response: {response.text[:50]}...")
             return response.text.strip()
         else:
             return None
             
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        
-        # Try fallback model if available
-        try:
-            if 'gemini-pro' not in str(gemini_model):
-                logger.info("🔄 Trying fallback model: gemini-pro")
-                fallback_model = genai.GenerativeModel('gemini-pro')
-                response = fallback_model.generate_content(full_prompt)
-                if response and response.text:
-                    return response.text.strip()
-        except:
-            pass
-        
+        logger.error(f"❌ Gemini error: {e}")
         return None
 
 async def get_llm_response(text: str, lang: str = "en"):
@@ -243,14 +264,20 @@ async def get_llm_response(text: str, lang: str = "en"):
 # ==================== TELEGRAM BOT HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
+    model_name = "Unknown"
+    if gemini_model:
+        try:
+            model_name = str(gemini_model._model_name).replace("models/", "")
+        except:
+            model_name = "Gemini 2.0 Flash Lite"
+    
     await update.message.reply_text(
-        "🎤 *IELTS ANGER TEACHER BOT*\n\n"
+        f"🎤 *IELTS ANGER TEACHER BOT*\n\n"
         "Send me a *voice message* in English or Russian.\n"
         "I'll criticize you mercilessly with VOICE replies!\n\n"
-        "🤖 *Powered by:*\n"
-        "• Gemini 1.5 Flash (brain)\n"
-        "• Deepgram (transcription)\n"
-        "• gTTS (free voice replies)\n\n"
+        f"🧠 *AI Model:* {model_name}\n"
+        "🎤 *STT:* Deepgram\n"
+        "🔊 *TTS:* gTTS (free)\n\n"
         "🔊 *Voice replies:* English & Russian\n"
         "📝 *Uzbek:* Text only\n\n"
         "*WARNING:* My patience is ZERO!",
@@ -268,12 +295,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("*[cracks knuckles]* Let's see what trash you sent me...")
     
     try:
+        # Download voice file
         file = await update.message.voice.get_file()
         
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
             await file.download_to_drive(tmp_file.name)
             audio_path = tmp_file.name
         
+        # Transcribe
         transcript, detected_lang = await transcribe_audio(audio_path)
         
         try:
@@ -285,16 +314,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("*[screams]* I CAN'T UNDERSTAND YOUR MUMBLING! Speak clearly, you vegetable!")
             return
         
+        # Send transcription
         await update.message.reply_text(
             f"🗣️ *You said:*\n_{transcript[:300]}_\n\n"
             f"🌍 *Language:* {detected_lang.upper()}",
             parse_mode="Markdown"
         )
         
+        # Get response from Gemini
         response_text = await get_llm_response(transcript, detected_lang)
         
+        # Send text response
         await update.message.reply_text(response_text, parse_mode="Markdown")
         
+        # Try voice reply
         if detected_lang in ["en", "ru"]:
             await update.message.reply_text("🔊 *Generating voice reply...*", parse_mode="Markdown")
             
@@ -340,11 +373,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Health check"""
+    model_name = "Unknown"
+    if gemini_model:
+        try:
+            model_name = str(gemini_model._model_name).replace("models/", "")
+        except:
+            model_name = "Gemini 2.0 Flash Lite"
+    
     await update.message.reply_text(
         f"🤖 *Bot Status:* Alive!\n\n"
-        f"✅ Gemini: {'Connected' if GEMINI_API_KEY else '❌ Missing'}\n"
-        f"✅ Deepgram: {'Connected' if DEEPGRAM_API_KEY else '❌ Missing'}\n"
-        f"✅ gTTS: Ready (free voice)\n\n"
+        f"🧠 *Gemini:* {model_name} ✅\n"
+        f"🎤 *Deepgram:* {'✅ Connected' if DEEPGRAM_API_KEY else '❌ Missing'}\n"
+        f"🔊 *gTTS:* Ready (free voice)\n\n"
         f"🔊 Voice replies: English, Russian\n"
         f"📝 Text replies: English, Russian, Uzbek\n\n"
         "*Now leave me alone!*",
@@ -362,16 +402,20 @@ def main():
     
     logger.info("🚀 Starting IELTS Anger Teacher Bot...")
     
+    # Start Flask web server for Render
     Thread(target=run_web, daemon=True).start()
     
+    # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_error_handler(error_handler)
     
+    # Start bot
     logger.info("✅ Bot is running on Telegram!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
