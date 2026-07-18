@@ -29,10 +29,20 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# Configure Gemini - FIXED MODEL NAME
+# Configure Gemini with better model
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-pro')  # ✅ Fixed
+    # Use gemini-1.5-flash (faster, better limits, cheaper)
+    # Fallback to gemini-pro if flash isn't available
+    try:
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+        # Test if model works
+        test_response = gemini_model.generate_content("test")
+        logger.info("✅ Using Gemini 1.5 Flash (faster, better limits)")
+    except Exception as e:
+        logger.warning(f"Gemini 1.5 Flash not available, falling back to gemini-pro: {e}")
+        gemini_model = genai.GenerativeModel('gemini-pro')
+        logger.info("✅ Using Gemini Pro")
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -84,73 +94,31 @@ IELTS_ANGER_PROMPT = """### CORE PERSONALITY TRAITS
 """
 
 # ==================== STT FUNCTIONS ====================
-async def transcribe_openai(audio_path: str):
-    """Transcribe using OpenAI Whisper API"""
-    if not OPENAI_API_KEY:
-        return None, None
-    
-    try:
-        url = "https://api.openai.com/v1/audio/transcriptions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
-        }
-        
-        with open(audio_path, "rb") as f:
-            files = {
-                "file": (os.path.basename(audio_path), f, "audio/ogg"),
-                "model": (None, "whisper-1"),
-                "language": (None, "auto")
-            }
-            response = requests.post(url, headers=headers, files=files, timeout=60)
-        
-        if response.status_code == 200:
-            data = response.json()
-            transcript = data.get("text", "")
-            
-            # Detect language from transcript
-            lang = "en"
-            cyrillic = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-            uzbek_latin = "қўғҳжўч"
-            
-            if any(char in cyrillic for char in transcript.lower()):
-                lang = "ru"
-            elif any(char in uzbek_latin for char in transcript.lower()):
-                lang = "uz"
-            
-            return transcript, lang
-        else:
-            logger.error(f"OpenAI Whisper error: {response.status_code}")
-            return None, None
-    except Exception as e:
-        logger.error(f"OpenAI Whisper error: {e}")
-        return None, None
-
 async def transcribe_deepgram(audio_path: str):
-    """Transcribe using Deepgram - FIXED"""
+    """Transcribe using Deepgram"""
     if not DEEPGRAM_API_KEY:
         return None, None
     
     try:
-        # Read raw audio data
-        with open(audio_path, "rb") as f:
+        with open(audio_path, 'rb') as f:
             audio_data = f.read()
         
         url = "https://api.deepgram.com/v1/listen"
         headers = {
-            "Authorization": f"Token {DEEPGRAM_API_KEY}",
+            "Authorization": f"Token {DEEPGRAM_API_KEY}"
         }
         params = {
             "model": "nova-2",
             "language": "multi",
-            "detect_language": True
+            "detect_language": "true",
+            "smart_format": "true"
         }
         
-        # Send raw data (Deepgram handles OGG)
         response = requests.post(
-            url, 
-            headers=headers, 
-            params=params, 
-            data=audio_data,  # ✅ Raw bytes, not multipart
+            url,
+            headers=headers,
+            params=params,
+            data=audio_data,
             timeout=60
         )
         
@@ -169,14 +137,7 @@ async def transcribe_deepgram(audio_path: str):
         return None, None
 
 async def transcribe_audio(audio_path: str):
-    """Try OpenAI Whisper first, then fallback to Deepgram"""
-    # Try OpenAI Whisper first
-    result = await transcribe_openai(audio_path)
-    if result and result[0]:
-        logger.info(f"✅ Transcribed with OpenAI Whisper")
-        return result
-    
-    # Fallback to Deepgram
+    """Transcribe using Deepgram"""
     result = await transcribe_deepgram(audio_path)
     if result and result[0]:
         logger.info(f"✅ Transcribed with Deepgram")
@@ -184,14 +145,13 @@ async def transcribe_audio(audio_path: str):
     
     return None, None
 
-# ==================== TTS FUNCTIONS (gTTS) ====================
+# ==================== TTS FUNCTIONS ====================
 async def generate_voice_reply(text: str, lang: str):
     """Generate voice reply using gTTS"""
     if lang not in ["en", "ru"]:
         return None
     
     try:
-        # Clean text
         clean_text = text.replace("*", "").replace("_", "").replace("[", "").replace("]", "").strip()
         clean_text = clean_text[:200]
         
@@ -200,12 +160,10 @@ async def generate_voice_reply(text: str, lang: str):
         
         logger.info(f"🔊 Generating TTS for: {clean_text[:50]}...")
         
-        # Create MP3 with gTTS
         tts = gTTS(text=clean_text, lang=lang, slow=False)
         mp3_path = f"/tmp/voice_{datetime.now().timestamp()}.mp3"
         tts.save(mp3_path)
         
-        # Convert to OGG for Telegram
         ogg_path = mp3_path.replace(".mp3", ".ogg")
         cmd = [
             "ffmpeg", "-i", mp3_path,
@@ -216,7 +174,6 @@ async def generate_voice_reply(text: str, lang: str):
         ]
         subprocess.run(cmd, capture_output=True, check=False)
         
-        # Clean up MP3
         try:
             os.unlink(mp3_path)
         except:
@@ -234,7 +191,7 @@ async def generate_voice_reply(text: str, lang: str):
 
 # ==================== LLM FUNCTIONS ====================
 async def get_llm_response_gemini(text: str, lang: str = "en"):
-    """Get response from Gemini"""
+    """Get response from Gemini with automatic model fallback"""
     if not GEMINI_API_KEY:
         return None
     
@@ -255,6 +212,18 @@ Respond in {lang} language with the same angry, savage energy. Keep it SHORT (2-
             
     except Exception as e:
         logger.error(f"Gemini error: {e}")
+        
+        # Try fallback model if available
+        try:
+            if 'gemini-pro' not in str(gemini_model):
+                logger.info("🔄 Trying fallback model: gemini-pro")
+                fallback_model = genai.GenerativeModel('gemini-pro')
+                response = fallback_model.generate_content(full_prompt)
+                if response and response.text:
+                    return response.text.strip()
+        except:
+            pass
+        
         return None
 
 async def get_llm_response(text: str, lang: str = "en"):
@@ -279,7 +248,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send me a *voice message* in English or Russian.\n"
         "I'll criticize you mercilessly with VOICE replies!\n\n"
         "🤖 *Powered by:*\n"
-        "• Gemini AI (brain)\n"
+        "• Gemini 1.5 Flash (brain)\n"
         "• Deepgram (transcription)\n"
         "• gTTS (free voice replies)\n\n"
         "🔊 *Voice replies:* English & Russian\n"
@@ -299,14 +268,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("*[cracks knuckles]* Let's see what trash you sent me...")
     
     try:
-        # Download voice file
         file = await update.message.voice.get_file()
         
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
             await file.download_to_drive(tmp_file.name)
             audio_path = tmp_file.name
         
-        # Transcribe
         transcript, detected_lang = await transcribe_audio(audio_path)
         
         try:
@@ -318,20 +285,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("*[screams]* I CAN'T UNDERSTAND YOUR MUMBLING! Speak clearly, you vegetable!")
             return
         
-        # Send transcription
         await update.message.reply_text(
             f"🗣️ *You said:*\n_{transcript[:300]}_\n\n"
             f"🌍 *Language:* {detected_lang.upper()}",
             parse_mode="Markdown"
         )
         
-        # Get response from Gemini
         response_text = await get_llm_response(transcript, detected_lang)
         
-        # Send text response
         await update.message.reply_text(response_text, parse_mode="Markdown")
         
-        # Try voice reply
         if detected_lang in ["en", "ru"]:
             await update.message.reply_text("🔊 *Generating voice reply...*", parse_mode="Markdown")
             
@@ -399,20 +362,16 @@ def main():
     
     logger.info("🚀 Starting IELTS Anger Teacher Bot...")
     
-    # Start Flask web server for Render
     Thread(target=run_web, daemon=True).start()
     
-    # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_error_handler(error_handler)
     
-    # Start bot
     logger.info("✅ Bot is running on Telegram!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
