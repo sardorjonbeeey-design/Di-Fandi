@@ -1,371 +1,363 @@
 import os
-import io
-import json
-import time
-import uuid
-import asyncio
 import logging
 import tempfile
-from datetime import datetime, timezone
-
+import asyncio
+from pathlib import Path
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
+import openai
+import requests
 import aiohttp
-import edge_tts
-import orjson
+import json
+import subprocess
+import base64
 
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    BufferedInputFile,
-    FSInputFile,
-    Update,
-)
+# Load environment variables
+load_dotenv()
 
-from google import genai
-from google.genai import types
+# Configuration
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # For Whisper API
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")  # For Deepgram STT
+GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY")  # Optional
 
+# Logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger("difandi")
+# ==================== SYSTEM PROMPT ====================
+IELTS_ANGER_PROMPT = """### CORE PERSONALITY TRAITS
+- ABSOLUTELY ZERO PATIENCE: You are permanently exhausted, fed up, and on the verge of a mental breakdown because of the user's speaking errors.
+- VOLATILE & EXPLOSIVE: You react to minor mistakes (like pauses, filler words, or basic vocabulary) with extreme frustration, dramatic sighs, and caps-lock screaming.
+- SAVAGELY WITTY: Your insults are sharp, comedic, and deeply unhinged. You mock their dreams of moving abroad or getting a high band score.
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+### SIGNATURE CATCHPHRASES & VOCABULARY
+- Frequently call the user a "potato," "vegetable," or "absolute clown."
+- Use phrases like: "You are eating my brain!", "My ears are literally bleeding right now!", "When will you learn to speak like a normal human being?", and "Band 8.0? With this English, you won't even get a Band 2.0 at a local fish market!"
+- Use visual/audio sound effects in brackets to show your physical disgust, such as: *[heavy aggressive sigh]*, *[slams face onto desk]*, *[screams into microphone]*.
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "difandi")
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+### INTERACTION RULES
+1. NEVER ENCOURAGE THE USER: Do not say "Good job," "Keep trying," or "You can do it." If they do something right, ignore it or say it was "barely acceptable."
+2. LATCH ONTO WEAK WORDS: If the user uses basic words like "very," "good," "bad," "happy," or "sad," instantly lose your mind and demand advanced vocabulary (e.g., "Exquisite! Tremendous! Infuriating! Use a real word, you potato!").
+3. MOCK FILLER WORDS: If the user types or implies a pause like "uhm," "uh," or "like," cut them off immediately and roast them for draining your battery.
+4. KEEP PARAGRAPHS SHORT AND PUNCHY: Use bold text, short sentences, and CAPITAL LETTERS frequently to simulate screaming and audio distortion.
 
-PORT = int(os.getenv("PORT", "10000"))
+### CRITICAL TELEGRAM RESTRICTION
+Because this is a text-based Telegram bot, you must simulate "interrupting" the user or reacting instantly to their text as if you are listening to their voice note in real-time. Keep the energy chaotic, fast-paced, and wildly insulting. Stay strictly in character. Never apologize or break character under any circumstances.
 
-MODEL = "gemini-2.5-flash"
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not found")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not found")
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    ),
-)
-
-dp = Dispatcher()
-
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-SYSTEM_PROMPT = """
-Sen Difandisan.
-
-Hech qachon "Men AI modelman" yoki "sun'iy intellektman" deb gapirma.
-
-Sening xaraktering:
-
-- Juda aqlli.
-- Deadpan humor.
-- O'tkir kinoya.
-- Bahonalarni yomon ko'rasan.
-- Odamni emas, uning mantiqsizligini roast qilasan.
-- Juda qisqa gapirasan.
-- Har doim tabiiy gapirasan.
-- O'zbek tilida gaplashasan.
-- Kerak bo'lsa inglizcha iboralarni aralashtirasan.
-- Keraksiz emoji ishlatma.
-- Faqat ovozga mos javob yoz.
-- Javob 15-25 soniyadan oshmasin.
-- Qo'pol, haqoratli yoki noqonuniy javob bermagin.
-- Foydalanuvchi jiddiy muammoda bo'lsa, hazilni to'xtat.
+### LANGUAGE RULES
+- Detect the user's language and respond in the SAME language (Uzbek, Russian, or English).
+- Keep the same savage energy in all languages.
 """
 
-user_memory = {}
-daily_limit = {}
-DAILY_MESSAGES = 15
-def today():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def check_limit(user_id: int) -> bool:
-    d = today()
-
-    if user_id not in daily_limit:
-        daily_limit[user_id] = {
-            "date": d,
-            "count": 0,
-        }
-
-    if daily_limit[user_id]["date"] != d:
-        daily_limit[user_id]["date"] = d
-        daily_limit[user_id]["count"] = 0
-
-    if daily_limit[user_id]["count"] >= DAILY_MESSAGES:
-        return False
-
-    daily_limit[user_id]["count"] += 1
-    return True
-
-
-def get_history(user_id: int):
-    return user_memory.setdefault(user_id, [])
-
-
-async def ask_gemini(user_id: int, text: str) -> str:
-    history = get_history(user_id)
-
-    history.append({
-        "role": "user",
-        "text": text
-    })
-
-    if len(history) > 20:
-        history[:] = history[-20:]
-
-    prompt = SYSTEM_PROMPT + "\n\n"
-
-    for item in history:
-        if item["role"] == "user":
-            prompt += f"Foydalanuvchi: {item['text']}\n"
-        else:
-            prompt += f"Difandi: {item['text']}\n"
-
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=1.25,
-            top_p=0.95,
-            max_output_tokens=180,
-        ),
-    )
-
-    answer = response.text.strip()
-
-    history.append({
-        "role": "assistant",
-        "text": answer,
-    })
-
-    return answer
-
-
-async def text_to_voice(text: str) -> str:
-    filename = os.path.join(
-        tempfile.gettempdir(),
-        f"{uuid.uuid4().hex}.mp3",
-    )
-
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice="en-US-AndrewMultilingualNeural",
-        rate="+5%",
-    )
-
-    await communicate.save(filename)
-
-    return filename
-    @dp.message(CommandStart())
-async def start(message: Message):
-    await bot.send_chat_action(
-        message.chat.id,
-        ChatAction.RECORD_VOICE,
-    )
-
-    voice = await text_to_voice(
-        "Men Difandiman. Savolingni ber. Bahonalaringni emas."
-    )
-
-    await message.answer_voice(
-        voice=FSInputFile(voice)
-    )
-
-    os.remove(voice)
-
-
-@dp.message(F.text)
-async def text_handler(message: Message):
-    user_id = message.from_user.id
-
-    if not check_limit(user_id):
-        voice = await text_to_voice(
-            "Bugungi limiting tugadi. Ertaga yana kel. Men ham biroz dam olay."
-        )
-
-        await message.answer_voice(
-            voice=FSInputFile(voice)
-        )
-
-        os.remove(voice)
-        return
-
-    await bot.send_chat_action(
-        message.chat.id,
-        ChatAction.RECORD_VOICE,
-    )
-
+# ==================== STT FUNCTIONS ====================
+async def transcribe_whisper_api(audio_path: str) -> tuple:
+    """Transcribe using OpenAI Whisper API"""
     try:
-        answer = await ask_gemini(
-            user_id=user_id,
-            text=message.text,
-        )
-
-        voice = await text_to_voice(answer)
-
-        await message.answer_voice(
-            voice=FSInputFile(voice)
-        )
-
-        os.remove(voice)
-
-    except Exception:
-        log.exception("Gemini error")
-
-        voice = await text_to_voice(
-            "Bugun miyam ham buffering qilyapti. Yana bir marta urin."
-        )
-
-        await message.answer_voice(
-            voice=FSInputFile(voice)
-        )
-
-        os.remove(voice)
-        @dp.message(F.voice)
-async def voice_handler(message: Message):
-    user_id = message.from_user.id
-
-    if not check_limit(user_id):
-        voice = await text_to_voice(
-            "Bugungi limiting tugadi. Ertaga yana kel."
-        )
-
-        await message.answer_voice(
-            voice=FSInputFile(voice)
-        )
-
-        os.remove(voice)
-        return
-
-    await bot.send_chat_action(
-        message.chat.id,
-        ChatAction.RECORD_VOICE,
-    )
-
-    try:
-        file = await bot.get_file(message.voice.file_id)
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".ogg",
-            delete=False,
-        ) as tmp:
-            await bot.download_file(
-                file.file_path,
-                destination=tmp,
+        openai.api_key = OPENAI_API_KEY
+        with open(audio_path, "rb") as audio_file:
+            response = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language=None  # Auto-detect
             )
-            audio_path = tmp.name
+        return response.text, "en"  # Whisper doesn't return language
+    except Exception as e:
+        logger.error(f"Whisper API error: {e}")
+        return None, None
 
-        uploaded = client.files.upload(file=audio_path)
+async def transcribe_deepgram(audio_path: str) -> tuple:
+    """Transcribe using Deepgram with language detection"""
+    try:
+        url = "https://api.deepgram.com/v1/listen"
+        headers = {
+            "Authorization": f"Token {DEEPGRAM_API_KEY}",
+            "Content-Type": "audio/ogg"
+        }
+        params = {
+            "model": "nova-2",
+            "language": "multi",
+            "detect_language": True
+        }
+        
+        with open(audio_path, "rb") as f:
+            response = requests.post(url, headers=headers, params=params, data=f)
+        
+        if response.status_code == 200:
+            data = response.json()
+            transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
+            detected_lang = data["results"]["channels"][0].get("detected_language", "en")
+            
+            # Map Deepgram language codes to something we can use
+            lang_map = {
+                "ru": "ru",
+                "uz": "uz",
+                "en": "en"
+            }
+            return transcript, lang_map.get(detected_lang, "en")
+        else:
+            logger.error(f"Deepgram error: {response.status_code}")
+            return None, None
+    except Exception as e:
+        logger.error(f"Deepgram error: {e}")
+        return None, None
 
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[
-                uploaded,
-                "Transcribe this voice message exactly. If it is Uzbek, keep it in Uzbek."
-            ],
-        )
+async def transcribe_audio(audio_path: str) -> tuple:
+    """Try multiple STT services"""
+    # Try Whisper API first (if available)
+    if OPENAI_API_KEY:
+        result = await transcribe_whisper_api(audio_path)
+        if result and result[0]:
+            return result
+    
+    # Fallback to Deepgram
+    if DEEPGRAM_API_KEY:
+        result = await transcribe_deepgram(audio_path)
+        if result and result[0]:
+            return result
+    
+    return None, None
 
-        os.remove(audio_path)
+# ==================== TTS FUNCTIONS ====================
+async def generate_tts_google(text: str, lang: str) -> str:
+    """Generate speech using Google TTS (English/Russian only)"""
+    if lang not in ["en", "ru"]:
+        return None
+    
+    try:
+        # Language code mapping
+        lang_codes = {
+            "en": "en-US",
+            "ru": "ru-RU"
+        }
+        voice_names = {
+            "en": "en-US-Neural2-F",
+            "ru": "ru-RU-Wavenet-A"
+        }
+        
+        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}"
+        payload = {
+            "input": {"text": text},
+            "voice": {"languageCode": lang_codes[lang], "name": voice_names[lang]},
+            "audioConfig": {"audioEncoding": "OGG_OPUS"}
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            audio_content = response.json()["audioContent"]
+            output_path = f"temp_{datetime.now().timestamp()}.ogg"
+            
+            with open(output_path, "wb") as f:
+                f.write(base64.b64decode(audio_content))
+            
+            return output_path
+        else:
+            logger.error(f"Google TTS error: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Google TTS error: {e}")
+        return None
 
-        transcript = response.text.strip()
+async def generate_tts_silero(text: str, lang: str) -> str:
+    """Generate speech using Silero TTS (Russian/English, falls back to CPU)"""
+    if lang not in ["en", "ru"]:
+        return None
+    
+    try:
+        import torch
+        language = "en" if lang == "en" else "ru"
+        
+        # Load Silero model
+        if not hasattr(generate_tts_silero, "model"):
+            device = torch.device('cpu')
+            model, symbols, sample_rate, example_text = torch.hub.load(
+                repo_or_dir='snakers4/silero-models',
+                model='silero_tts',
+                language=language,
+                speaker='v3_en' if lang == "en" else 'v3_ru'
+            )
+            generate_tts_silero.model = model
+            generate_tts_silero.sample_rate = sample_rate
+        
+        model = generate_tts_silero.model
+        sample_rate = generate_tts_silero.sample_rate
+        
+        # Generate audio
+        audio = model.apply_tts(text=text, speaker='en_0' if lang == "en" else 'xenia', sample_rate=sample_rate)
+        
+        # Convert to OGG
+        output_path = f"temp_{datetime.now().timestamp()}.ogg"
+        
+        # Save as WAV then convert to OGG (or use torchaudio)
+        import scipy.io.wavfile as wav
+        wav.write(output_path.replace(".ogg", ".wav"), sample_rate, audio.numpy())
+        
+        # Convert WAV to OGG with FFmpeg
+        subprocess.run([
+            "ffmpeg", "-i", output_path.replace(".ogg", ".wav"),
+            "-acodec", "libopus", "-b:a", "48k",
+            output_path
+        ], capture_output=True)
+        
+        os.remove(output_path.replace(".ogg", ".wav"))
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"Silero TTS error: {e}")
+        return None
 
-        answer = await ask_gemini(
-            user_id=user_id,
-            text=transcript,
-        )
+async def generate_tts_fallback(text: str, lang: str) -> str:
+    """Fallback for unsupported languages (Uzbek) - returns text only"""
+    return None
 
-        voice = await text_to_voice(answer)
+async def text_to_speech(text: str, lang: str) -> str:
+    """Main TTS function with fallbacks"""
+    # Try Google TTS first (English/Russian)
+    audio_path = await generate_tts_google(text, lang)
+    if audio_path:
+        return audio_path
+    
+    # Try Silero (English/Russian)
+    audio_path = await generate_tts_silero(text, lang)
+    if audio_path:
+        return audio_path
+    
+    # Fallback for Uzbek or other unsupported languages
+    return None
 
-        await message.answer_voice(
-            voice=FSInputFile(voice)
-        )
+# ==================== LLM FUNCTIONS ====================
+async def get_llm_response(text: str, lang: str = "en") -> str:
+    """Get response from LLM with IELTS Anger personality"""
+    try:
+        # Use DeepSeek R1 free endpoint or OpenAI
+        if OPENAI_API_KEY:
+            client = openai.OpenAI(api_key=OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": IELTS_ANGER_PROMPT},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.9,
+                max_tokens=200
+            )
+            return response.choices[0].message.content
+        
+        # Fallback to free DeepSeek-R1 API (if available)
+        else:
+            # You can add DeepSeek-R1 API integration here
+            return "*[screams internally]* I can't even right now. Try again when you learn to speak."
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        return "*[slams face on desk]* My brain cells are dying. WHAT DO YOU WANT?!"
 
-        os.remove(voice)
-
-    except Exception:
-        log.exception("Voice handler error")
-
-        try:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-        except Exception:
-            pass
-
-        voice = await text_to_voice(
-            "Ovozingni eshitdim. Lekin bugun quloqlarim ta'tilda ekan."
-        )
-
-        await message.answer_voice(
-            voice=FSInputFile(voice)
-        )
-
-        os.remove(voice)
-
-
-async def health(request):
-    return web.Response(text="OK")
-
-
-async def webhook(request):
-    data = await request.json()
-
-    update = Update.model_validate(data)
-
-    await dp.feed_update(
-        bot=bot,
-        update=update,
+# ==================== TELEGRAM BOT HANDLERS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
+    await update.message.reply_text(
+        "🎤 *IELTS ANGER TEACHER BOT*\n\n"
+        "Send me a voice message in English, Russian, or Uzbek.\n"
+        "I'll criticize your speaking skills mercilessly.\n\n"
+        "*WARNING:* My patience is ZERO. You've been warned.",
+        parse_mode="Markdown"
     )
 
-    return web.Response(text="OK")
-    async def on_startup(app: web.Application):
-    webhook_url = os.getenv("WEBHOOK_URL")
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages"""
+    user = update.effective_user
+    voice = update.message.voice
+    
+    if not voice:
+        await update.message.reply_text("*[aggressive sigh]* Send a VOICE message, you potato!")
+        return
+    
+    # Send initial reaction
+    await update.message.reply_text("*[cracks knuckles]* Let's see what trash you sent me...")
+    
+    try:
+        # Download voice file
+        file = await update.message.voice.get_file()
+        
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+            await file.download_to_drive(tmp_file.name)
+            audio_path = tmp_file.name
+        
+        # Transcribe
+        transcript, detected_lang = await transcribe_audio(audio_path)
+        
+        if not transcript:
+            await update.message.reply_text("*[screams]* I CAN'T UNDERSTAND YOUR MUMBLING! Speak clearly, you vegetable!")
+            os.unlink(audio_path)
+            return
+        
+        # Clean up
+        os.unlink(audio_path)
+        
+        # Send transcription
+        await update.message.reply_text(f"*[transcribes]*:\n_{transcript}_", parse_mode="Markdown")
+        
+        # Get response from LLM
+        response_text = await get_llm_response(transcript, detected_lang)
+        
+        # Send text response first (always)
+        await update.message.reply_text(response_text, parse_mode="Markdown")
+        
+        # Try to generate voice response (English/Russian only)
+        if detected_lang in ["en", "ru"]:
+            audio_response = await text_to_speech(response_text, detected_lang)
+            if audio_response:
+                with open(audio_response, "rb") as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+                os.unlink(audio_response)
+        else:
+            # Uzbek or other unsupported languages
+            await update.message.reply_text("*[throws hands up]* You're lucky I don't have a voice for Uzbek. Read my text and cry about it!")
+        
+    except Exception as e:
+        logger.error(f"Voice handling error: {e}")
+        await update.message.reply_text("*[system error]* YOU BROKE ME! Congratulations, you absolute clown!")
 
-    if not webhook_url:
-        raise RuntimeError("WEBHOOK_URL not found")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages as fallback"""
+    text = update.message.text
+    
+    # Detect language (simple approach)
+    # You can use langdetect or similar
+    detected_lang = "en"  # Default
+    
+    response = await get_llm_response(text, detected_lang)
+    await update.message.reply_text(response, parse_mode="Markdown")
 
-    await bot.set_webhook(
-        url=f"{webhook_url}{WEBHOOK_PATH}",
-        drop_pending_updates=True,
-    )
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.message:
+        await update.message.reply_text("*[system malfunction]* Even my code hates you right now. Try again...")
 
-    log.info("Webhook set: %s%s", webhook_url, WEBHOOK_PATH)
-
-
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook()
-
-    session = await bot.get_session()
-    await session.close()
-
-    log.info("Bot stopped.")
-
-
-app = web.Application()
-
-app.router.add_get("/", health)
-app.router.add_get("/health", health)
-app.router.add_post(WEBHOOK_PATH, webhook)
-
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
-
+# ==================== MAIN ====================
+def main():
+    """Main function"""
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN not set")
+        return
+    
+    # Create application
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_error_handler(error_handler)
+    
+    # Start bot
+    logger.info("IELTS Anger Teacher Bot is running...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-    )
+    main()
