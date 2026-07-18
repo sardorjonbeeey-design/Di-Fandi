@@ -17,11 +17,11 @@ from threading import Thread
 from gtts import gTTS
 import subprocess
 
-# Load environment variables (silently fails if .env doesn't exist)
+# Load environment variables
 try:
     load_dotenv()
 except:
-    pass  # Silently fail on Render
+    pass
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -29,10 +29,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# Configure Gemini
+# Configure Gemini - FIXED MODEL NAME
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    gemini_model = genai.GenerativeModel('gemini-pro')  # ✅ Fixed
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -41,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== FLASK WEB SERVER (for Render) ====================
+# ==================== FLASK WEB SERVER ====================
 app = Flask('')
 
 @app.route('/')
@@ -119,22 +119,25 @@ async def transcribe_openai(audio_path: str):
             
             return transcript, lang
         else:
-            logger.error(f"OpenAI Whisper error: {response.status_code} - {response.text}")
+            logger.error(f"OpenAI Whisper error: {response.status_code}")
             return None, None
     except Exception as e:
         logger.error(f"OpenAI Whisper error: {e}")
         return None, None
 
 async def transcribe_deepgram(audio_path: str):
-    """Transcribe using Deepgram"""
+    """Transcribe using Deepgram - FIXED"""
     if not DEEPGRAM_API_KEY:
         return None, None
     
     try:
+        # Read raw audio data
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        
         url = "https://api.deepgram.com/v1/listen"
         headers = {
             "Authorization": f"Token {DEEPGRAM_API_KEY}",
-            "Content-Type": "audio/ogg"
         }
         params = {
             "model": "nova-2",
@@ -142,8 +145,14 @@ async def transcribe_deepgram(audio_path: str):
             "detect_language": True
         }
         
-        with open(audio_path, "rb") as f:
-            response = requests.post(url, headers=headers, params=params, data=f, timeout=60)
+        # Send raw data (Deepgram handles OGG)
+        response = requests.post(
+            url, 
+            headers=headers, 
+            params=params, 
+            data=audio_data,  # ✅ Raw bytes, not multipart
+            timeout=60
+        )
         
         if response.status_code == 200:
             data = response.json()
@@ -153,7 +162,7 @@ async def transcribe_deepgram(audio_path: str):
             lang_map = {"ru": "ru", "uz": "uz", "en": "en"}
             return transcript, lang_map.get(detected_lang, "en")
         else:
-            logger.error(f"Deepgram error: {response.status_code}")
+            logger.error(f"Deepgram error: {response.status_code} - {response.text}")
             return None, None
     except Exception as e:
         logger.error(f"Deepgram error: {e}")
@@ -161,7 +170,7 @@ async def transcribe_deepgram(audio_path: str):
 
 async def transcribe_audio(audio_path: str):
     """Try OpenAI Whisper first, then fallback to Deepgram"""
-    # Try OpenAI Whisper first (best quality)
+    # Try OpenAI Whisper first
     result = await transcribe_openai(audio_path)
     if result and result[0]:
         logger.info(f"✅ Transcribed with OpenAI Whisper")
@@ -175,53 +184,53 @@ async def transcribe_audio(audio_path: str):
     
     return None, None
 
-# ==================== TTS FUNCTIONS (gTTS - FREE) ====================
-async def generate_tts_gtts(text: str, lang: str):
-    """Generate speech using gTTS (completely free, no API key needed)"""
+# ==================== TTS FUNCTIONS (gTTS) ====================
+async def generate_voice_reply(text: str, lang: str):
+    """Generate voice reply using gTTS"""
     if lang not in ["en", "ru"]:
         return None
     
     try:
-        # Clean text for TTS
-        clean_text = text.replace("*", "").replace("_", "").replace("[", "").replace("]", "")
-        clean_text = clean_text[:300]  # Limit length
+        # Clean text
+        clean_text = text.replace("*", "").replace("_", "").replace("[", "").replace("]", "").strip()
+        clean_text = clean_text[:200]
         
-        # Map language codes for gTTS
-        lang_map = {
-            "en": "en",
-            "ru": "ru"
-        }
+        if not clean_text:
+            return None
         
-        # Generate speech
-        tts = gTTS(text=clean_text, lang=lang_map[lang], slow=False)
-        output_path = f"/tmp/tts_{datetime.now().timestamp()}.mp3"
-        tts.save(output_path)
+        logger.info(f"🔊 Generating TTS for: {clean_text[:50]}...")
         
-        # Convert MP3 to OGG for Telegram
-        ogg_path = output_path.replace(".mp3", ".ogg")
-        subprocess.run([
-            "ffmpeg", "-i", output_path,
-            "-acodec", "libopus", "-b:a", "48k",
+        # Create MP3 with gTTS
+        tts = gTTS(text=clean_text, lang=lang, slow=False)
+        mp3_path = f"/tmp/voice_{datetime.now().timestamp()}.mp3"
+        tts.save(mp3_path)
+        
+        # Convert to OGG for Telegram
+        ogg_path = mp3_path.replace(".mp3", ".ogg")
+        cmd = [
+            "ffmpeg", "-i", mp3_path,
+            "-acodec", "libopus",
+            "-b:a", "48k",
+            "-y",
             ogg_path
-        ], capture_output=True)
+        ]
+        subprocess.run(cmd, capture_output=True, check=False)
         
         # Clean up MP3
         try:
-            os.unlink(output_path)
+            os.unlink(mp3_path)
         except:
             pass
         
-        return ogg_path
+        if os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 1000:
+            logger.info(f"✅ Voice file created: {ogg_path}")
+            return ogg_path
+        else:
+            return None
+            
     except Exception as e:
-        logger.error(f"gTTS error: {e}")
+        logger.error(f"❌ TTS error: {e}")
         return None
-
-async def text_to_speech(text: str, lang: str):
-    """Main TTS function using gTTS"""
-    if lang not in ["en", "ru"]:
-        return None
-    
-    return await generate_tts_gtts(text, lang)
 
 # ==================== LLM FUNCTIONS ====================
 async def get_llm_response_gemini(text: str, lang: str = "en"):
@@ -235,7 +244,7 @@ async def get_llm_response_gemini(text: str, lang: str = "en"):
 User language: {lang}
 User said: {text}
 
-Respond in {lang} language with the same angry, savage energy. Keep it short (2-3 sentences)."""
+Respond in {lang} language with the same angry, savage energy. Keep it SHORT (2-3 sentences maximum). Make it sound natural when spoken aloud."""
         
         response = gemini_model.generate_content(full_prompt)
         
@@ -250,18 +259,15 @@ Respond in {lang} language with the same angry, savage energy. Keep it short (2-
 
 async def get_llm_response(text: str, lang: str = "en"):
     """Main LLM function with fallbacks"""
-    # Try Gemini first
     result = await get_llm_response_gemini(text, lang)
     if result:
         return result
     
-    # Fallback responses
     fallbacks = [
         "*[slams face on desk]* My brain cells are dying. WHAT DO YOU WANT?!",
         "*[screams into microphone]* Is this the best you can do?!",
         "*[aggressive sigh]* I'm losing IQ points just listening to you!",
-        "You call that English?! My dead grandmother speaks better!",
-        "*[throws laptop out window]* I QUIT! Find another examiner, you potato!"
+        "You call that English?! My dead grandmother speaks better!"
     ]
     return random.choice(fallbacks)
 
@@ -270,36 +276,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     await update.message.reply_text(
         "🎤 *IELTS ANGER TEACHER BOT*\n\n"
-        "Send me a *voice message* in English, Russian, or Uzbek.\n"
-        "I'll criticize your speaking skills mercilessly!\n\n"
+        "Send me a *voice message* in English or Russian.\n"
+        "I'll criticize you mercilessly with VOICE replies!\n\n"
         "🤖 *Powered by:*\n"
         "• Gemini AI (brain)\n"
-        "• OpenAI Whisper (transcription)\n"
-        "• Deepgram (backup STT)\n"
+        "• Deepgram (transcription)\n"
         "• gTTS (free voice replies)\n\n"
-        "⚠️ *Voice replies:* English & Russian only\n"
-        "📝 *Uzbek:* Text replies only\n\n"
-        "🔊 *Commands:*\n"
-        "/start - Welcome\n"
-        "/health - Check status\n"
-        "/help - Get help\n\n"
+        "🔊 *Voice replies:* English & Russian\n"
+        "📝 *Uzbek:* Text only\n\n"
         "*WARNING:* My patience is ZERO!",
-        parse_mode="Markdown"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command"""
-    await update.message.reply_text(
-        "🎯 *How to use:*\n\n"
-        "1. Send a voice message\n"
-        "2. I'll transcribe (OpenAI Whisper/Deepgram)\n"
-        "3. Gemini generates a savage response\n"
-        "4. I reply with text + voice (English/Russian)\n\n"
-        "💡 *Tips:*\n"
-        "- Speak clearly or get mocked\n"
-        "- Use advanced vocabulary\n"
-        "- Don't use filler words\n\n"
-        "*Good luck, you'll need it!*",
         parse_mode="Markdown"
     )
 
@@ -311,7 +296,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("*[aggressive sigh]* Send a VOICE message, you potato!")
         return
     
-    # Send initial reaction
     await update.message.reply_text("*[cracks knuckles]* Let's see what trash you sent me...")
     
     try:
@@ -322,10 +306,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file.download_to_drive(tmp_file.name)
             audio_path = tmp_file.name
         
-        # Transcribe with OpenAI Whisper + Deepgram fallback
+        # Transcribe
         transcript, detected_lang = await transcribe_audio(audio_path)
         
-        # Clean up audio file
         try:
             os.unlink(audio_path)
         except:
@@ -338,7 +321,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send transcription
         await update.message.reply_text(
             f"🗣️ *You said:*\n_{transcript[:300]}_\n\n"
-            f"🌍 *Detected:* {detected_lang.upper()}",
+            f"🌍 *Language:* {detected_lang.upper()}",
             parse_mode="Markdown"
         )
         
@@ -348,20 +331,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send text response
         await update.message.reply_text(response_text, parse_mode="Markdown")
         
-        # Try voice reply (English/Russian only)
+        # Try voice reply
         if detected_lang in ["en", "ru"]:
-            await update.message.reply_text("🔊 *Generating voice...*", parse_mode="Markdown")
-            audio_response = await text_to_speech(response_text, detected_lang)
+            await update.message.reply_text("🔊 *Generating voice reply...*", parse_mode="Markdown")
             
-            if audio_response and os.path.exists(audio_response):
+            voice_file = await generate_voice_reply(response_text, detected_lang)
+            
+            if voice_file and os.path.exists(voice_file):
                 try:
-                    with open(audio_response, "rb") as audio_file:
-                        await update.message.reply_voice(voice=audio_file)
-                    os.unlink(audio_response)
+                    with open(voice_file, "rb") as f:
+                        await update.message.reply_voice(voice=f)
+                    os.unlink(voice_file)
+                    logger.info("✅ Voice reply sent successfully!")
                 except Exception as e:
-                    logger.error(f"Voice reply error: {e}")
+                    logger.error(f"❌ Failed to send voice: {e}")
+                    await update.message.reply_text("*[voice failed]* Just read my text, potato!")
             else:
-                await update.message.reply_text("*[TTS failed]* Just read my text, you potato!")
+                await update.message.reply_text("*[TTS failed]* Read my text and cry about it!")
         else:
             await update.message.reply_text(
                 "📝 *Uzbek voice not supported yet.*\n"
@@ -370,14 +356,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
     except Exception as e:
-        logger.error(f"Voice handling error: {e}")
-        await update.message.reply_text("*[system error]* YOU BROKE ME! Congratulations, you absolute clown!")
+        logger.error(f"❌ Voice handling error: {e}")
+        await update.message.reply_text("*[system error]* YOU BROKE ME! Congratulations!")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages"""
     text = update.message.text
     
-    # Language detection
     detected_lang = "en"
     cyrillic = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
     uzbek_latin = "қўғҳжўч"
@@ -392,23 +377,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Health check"""
-    status = []
-    status.append("✅ OpenAI" if OPENAI_API_KEY else "❌ OpenAI")
-    status.append("✅ Gemini" if GEMINI_API_KEY else "❌ Gemini")
-    status.append("✅ Deepgram" if DEEPGRAM_API_KEY else "❌ Deepgram")
-    status.append("✅ gTTS" if True else "❌ gTTS")  # gTTS always available
-    
     await update.message.reply_text(
         f"🤖 *Bot Status:* Alive!\n\n"
-        f"{chr(10).join(status)}\n\n"
-        f"📝 *Supported:* English, Russian, Uzbek\n"
-        f"🔊 *Voice:* English, Russian (gTTS - Free)\n\n"
+        f"✅ Gemini: {'Connected' if GEMINI_API_KEY else '❌ Missing'}\n"
+        f"✅ Deepgram: {'Connected' if DEEPGRAM_API_KEY else '❌ Missing'}\n"
+        f"✅ gTTS: Ready (free voice)\n\n"
+        f"🔊 Voice replies: English, Russian\n"
+        f"📝 Text replies: English, Russian, Uzbek\n\n"
         "*Now leave me alone!*",
         parse_mode="Markdown"
     )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors"""
     logger.error(f"Update {update} caused error {context.error}")
 
 # ==================== MAIN ====================
@@ -427,13 +407,12 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_error_handler(error_handler)
     
-    # Start bot - polling mode
+    # Start bot
     logger.info("✅ Bot is running on Telegram!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
