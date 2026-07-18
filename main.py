@@ -1,12 +1,8 @@
 import os
 import logging
 import tempfile
-import base64
-import json
 import random
-import asyncio
 from datetime import datetime
-from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -14,7 +10,7 @@ import requests
 import google.generativeai as genai
 from flask import Flask
 from threading import Thread
-from gtts import gTTS
+import edge_tts
 import subprocess
 
 # ==================== LOAD ENVIRONMENT ====================
@@ -32,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
@@ -43,27 +38,22 @@ if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # Try Gemini 2.0 Flash Lite first (fastest, best free tier)
         model_names = [
-            'gemini-2.0-flash-lite',    # Fastest, best limits
-            'gemini-2.0-flash-lite-preview-02-05',  # Preview version
-            'gemini-2.0-flash',         # Regular flash
-            'gemini-1.5-flash',         # Stable fallback
-            'gemini-pro'                # Legacy fallback
+            'gemini-2.0-flash-lite',
+            'gemini-2.0-flash',
+            'gemini-1.5-flash',
+            'gemini-pro'
         ]
         
         for model_name in model_names:
             try:
-                logger.info(f"🔄 Trying Gemini model: {model_name}")
                 test_model = genai.GenerativeModel(model_name)
-                # Quick test
                 test_response = test_model.generate_content("test")
                 if test_response and test_response.text is not None:
                     gemini_model = test_model
                     logger.info(f"✅ Using Gemini model: {model_name}")
                     break
-            except Exception as e:
-                logger.warning(f"❌ Model {model_name} failed: {str(e)[:50]}")
+            except:
                 continue
         
         if gemini_model is None:
@@ -106,7 +96,7 @@ IELTS_ANGER_PROMPT = """### CORE PERSONALITY TRAITS
 4. KEEP RESPONSES SHORT AND PUNCHY: Use short sentences and CAPITAL LETTERS.
 
 ### VOICE RESPONSE RULES
-- The user sends VOICE MESSAGES and you respond with VOICE MESSAGES.
+- The user sends VOICE MESSAGES and you respond with VOICE MESSAGES ONLY.
 - Your response will be spoken out loud, so write naturally for speech.
 - Use dramatic pauses, sighs, and aggressive tones in your wording.
 - Keep responses concise (2-3 sentences max) so the voice message isn't too long.
@@ -120,7 +110,6 @@ IELTS_ANGER_PROMPT = """### CORE PERSONALITY TRAITS
 async def transcribe_deepgram(audio_path: str):
     """Transcribe using Deepgram"""
     if not DEEPGRAM_API_KEY:
-        logger.error("❌ DEEPGRAM_API_KEY not set!")
         return None, None
     
     try:
@@ -138,7 +127,6 @@ async def transcribe_deepgram(audio_path: str):
             "smart_format": "true"
         }
         
-        logger.info("🎤 Sending audio to Deepgram...")
         response = requests.post(
             url,
             headers=headers,
@@ -153,27 +141,21 @@ async def transcribe_deepgram(audio_path: str):
             detected_lang = data["results"]["channels"][0].get("detected_language", "en")
             
             lang_map = {"ru": "ru", "uz": "uz", "en": "en"}
-            logger.info(f"✅ Deepgram transcribed: {transcript[:50]}...")
             return transcript, lang_map.get(detected_lang, "en")
         else:
-            logger.error(f"❌ Deepgram error: {response.status_code} - {response.text}")
+            logger.error(f"Deepgram error: {response.status_code}")
             return None, None
     except Exception as e:
-        logger.error(f"❌ Deepgram error: {e}")
+        logger.error(f"Deepgram error: {e}")
         return None, None
 
 async def transcribe_audio(audio_path: str):
     """Transcribe using Deepgram"""
-    result = await transcribe_deepgram(audio_path)
-    if result and result[0]:
-        return result
-    
-    logger.error("❌ All transcription methods failed!")
-    return None, None
+    return await transcribe_deepgram(audio_path)
 
-# ==================== TTS FUNCTIONS ====================
+# ==================== TTS FUNCTIONS (Edge TTS) ====================
 async def generate_voice_reply(text: str, lang: str):
-    """Generate voice reply using gTTS"""
+    """Generate emotional voice reply using Edge TTS"""
     if lang not in ["en", "ru"]:
         return None
     
@@ -184,15 +166,28 @@ async def generate_voice_reply(text: str, lang: str):
         if not clean_text:
             return None
         
-        logger.info(f"🔊 Generating TTS for: {clean_text[:50]}...")
+        logger.info(f"🔊 Generating voice: {clean_text[:50]}...")
         
-        tts = gTTS(text=clean_text, lang=lang, slow=False)
-        mp3_path = f"/tmp/voice_{datetime.now().timestamp()}.mp3"
-        tts.save(mp3_path)
+        voices = {
+            "en": "en-US-AriaNeural",
+            "ru": "ru-RU-DariyaNeural"
+        }
         
-        ogg_path = mp3_path.replace(".mp3", ".ogg")
+        voice = voices.get(lang, "en-US-AriaNeural")
+        output_path = f"/tmp/voice_{datetime.now().timestamp()}.mp3"
+        
+        tts = edge_tts.Communicate(
+            text=clean_text,
+            voice=voice,
+            rate="+5%",
+            pitch="+2%"
+        )
+        
+        await tts.save(output_path)
+        
+        ogg_path = output_path.replace(".mp3", ".ogg")
         cmd = [
-            "ffmpeg", "-i", mp3_path,
+            "ffmpeg", "-i", output_path,
             "-acodec", "libopus",
             "-b:a", "48k",
             "-y",
@@ -201,30 +196,23 @@ async def generate_voice_reply(text: str, lang: str):
         subprocess.run(cmd, capture_output=True, check=False)
         
         try:
-            os.unlink(mp3_path)
+            os.unlink(output_path)
         except:
             pass
         
         if os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 1000:
-            logger.info(f"✅ Voice file created: {ogg_path}")
             return ogg_path
         else:
-            logger.error("❌ FFmpeg conversion failed")
             return None
             
     except Exception as e:
-        logger.error(f"❌ TTS error: {e}")
+        logger.error(f"TTS error: {e}")
         return None
 
 # ==================== LLM FUNCTIONS ====================
 async def get_llm_response_gemini(text: str, lang: str = "en"):
     """Get response from Gemini"""
-    if not GEMINI_API_KEY:
-        logger.error("❌ GEMINI_API_KEY not set!")
-        return None
-    
-    if gemini_model is None:
-        logger.error("❌ No Gemini model available!")
+    if not GEMINI_API_KEY or gemini_model is None:
         return None
     
     try:
@@ -238,13 +226,12 @@ Respond in {lang} language with the same angry, savage energy. Keep it SHORT (2-
         response = gemini_model.generate_content(full_prompt)
         
         if response and response.text:
-            logger.info(f"✅ Gemini response: {response.text[:50]}...")
             return response.text.strip()
         else:
             return None
             
     except Exception as e:
-        logger.error(f"❌ Gemini error: {e}")
+        logger.error(f"Gemini error: {e}")
         return None
 
 async def get_llm_response(text: str, lang: str = "en"):
@@ -263,36 +250,23 @@ async def get_llm_response(text: str, lang: str = "en"):
 
 # ==================== TELEGRAM BOT HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    model_name = "Unknown"
-    if gemini_model:
-        try:
-            model_name = str(gemini_model._model_name).replace("models/", "")
-        except:
-            model_name = "Gemini 2.0 Flash Lite"
-    
+    """Start command handler - only message ever sent"""
     await update.message.reply_text(
-        f"🎤 *IELTS ANGER TEACHER BOT*\n\n"
-        "Send me a *voice message* in English or Russian.\n"
-        "I'll criticize you mercilessly with VOICE replies!\n\n"
-        f"🧠 *AI Model:* {model_name}\n"
-        "🎤 *STT:* Deepgram\n"
-        "🔊 *TTS:* gTTS (free)\n\n"
-        "🔊 *Voice replies:* English & Russian\n"
+        "🎤 *IELTS ANGER TEACHER BOT*\n\n"
+        "Send me a voice message.\n"
+        "I'll reply with voice - no text!\n\n"
+        "🔊 *Languages:* English, Russian (voice)\n"
         "📝 *Uzbek:* Text only\n\n"
         "*WARNING:* My patience is ZERO!",
         parse_mode="Markdown"
     )
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle voice messages"""
+    """Handle voice messages - SILENT MODE - NO TEXT"""
     voice = update.message.voice
     
     if not voice:
-        await update.message.reply_text("*[aggressive sigh]* Send a VOICE message, you potato!")
         return
-    
-    await update.message.reply_text("*[cracks knuckles]* Let's see what trash you sent me...")
     
     try:
         # Download voice file
@@ -311,26 +285,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         
         if not transcript or len(transcript.strip()) < 2:
-            await update.message.reply_text("*[screams]* I CAN'T UNDERSTAND YOUR MUMBLING! Speak clearly, you vegetable!")
+            # Send error voice message
+            error_text = "*[screams]* I CAN'T UNDERSTAND YOUR MUMBLING! Speak clearly, you vegetable!"
+            voice_file = await generate_voice_reply(error_text, "en")
+            if voice_file:
+                with open(voice_file, "rb") as f:
+                    await update.message.reply_voice(voice=f)
+                os.unlink(voice_file)
             return
-        
-        # Send transcription
-        await update.message.reply_text(
-            f"🗣️ *You said:*\n_{transcript[:300]}_\n\n"
-            f"🌍 *Language:* {detected_lang.upper()}",
-            parse_mode="Markdown"
-        )
         
         # Get response from Gemini
         response_text = await get_llm_response(transcript, detected_lang)
         
-        # Send text response
-        await update.message.reply_text(response_text, parse_mode="Markdown")
-        
-        # Try voice reply
+        # Generate voice reply
         if detected_lang in ["en", "ru"]:
-            await update.message.reply_text("🔊 *Generating voice reply...*", parse_mode="Markdown")
-            
             voice_file = await generate_voice_reply(response_text, detected_lang)
             
             if voice_file and os.path.exists(voice_file):
@@ -338,25 +306,30 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     with open(voice_file, "rb") as f:
                         await update.message.reply_voice(voice=f)
                     os.unlink(voice_file)
-                    logger.info("✅ Voice reply sent successfully!")
+                    logger.info("✅ Voice reply sent (silent mode)")
                 except Exception as e:
-                    logger.error(f"❌ Failed to send voice: {e}")
-                    await update.message.reply_text("*[voice failed]* Just read my text, potato!")
+                    logger.error(f"Failed to send voice: {e}")
+                    # Silent fail - don't send text
             else:
-                await update.message.reply_text("*[TTS failed]* Read my text and cry about it!")
+                # Try English voice as fallback
+                voice_file = await generate_voice_reply(response_text, "en")
+                if voice_file:
+                    with open(voice_file, "rb") as f:
+                        await update.message.reply_voice(voice=f)
+                    os.unlink(voice_file)
         else:
+            # Uzbek - send text (only non-voice response)
             await update.message.reply_text(
-                "📝 *Uzbek voice not supported yet.*\n"
+                "📝 *Uzbek voice not supported.*\n"
                 "Read the text and practice!",
                 parse_mode="Markdown"
             )
         
     except Exception as e:
-        logger.error(f"❌ Voice handling error: {e}")
-        await update.message.reply_text("*[system error]* YOU BROKE ME! Congratulations!")
+        logger.error(f"Voice handling error: {e}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
+    """Handle text messages - only for Uzbek fallback"""
     text = update.message.text
     
     detected_lang = "en"
@@ -373,20 +346,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Health check"""
-    model_name = "Unknown"
-    if gemini_model:
-        try:
-            model_name = str(gemini_model._model_name).replace("models/", "")
-        except:
-            model_name = "Gemini 2.0 Flash Lite"
-    
     await update.message.reply_text(
         f"🤖 *Bot Status:* Alive!\n\n"
-        f"🧠 *Gemini:* {model_name} ✅\n"
-        f"🎤 *Deepgram:* {'✅ Connected' if DEEPGRAM_API_KEY else '❌ Missing'}\n"
-        f"🔊 *gTTS:* Ready (free voice)\n\n"
-        f"🔊 Voice replies: English, Russian\n"
-        f"📝 Text replies: English, Russian, Uzbek\n\n"
+        f"✅ Gemini: Connected\n"
+        f"✅ Deepgram: Connected\n"
+        f"✅ Edge TTS: Ready (emotional)\n\n"
+        f"🔊 *Silent Mode:* ON (voice only)\n"
         "*Now leave me alone!*",
         parse_mode="Markdown"
     )
@@ -400,7 +365,7 @@ def main():
         logger.error("❌ TELEGRAM_TOKEN not set!")
         return
     
-    logger.info("🚀 Starting IELTS Anger Teacher Bot...")
+    logger.info("🚀 Starting IELTS Anger Teacher Bot (Silent Mode)...")
     
     # Start Flask web server for Render
     Thread(target=run_web, daemon=True).start()
@@ -416,7 +381,7 @@ def main():
     application.add_error_handler(error_handler)
     
     # Start bot
-    logger.info("✅ Bot is running on Telegram!")
+    logger.info("✅ Bot is running (Silent Mode - Voice Only)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
