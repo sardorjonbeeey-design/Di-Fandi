@@ -10,8 +10,8 @@ python-dotenv==1.0.0
 # Google Gemini AI
 google-generativeai==0.3.2
 
-# Optional but recommended for better performance
-# aiohttp==3.9.1  # For async HTTP requests (if you add more features)
+# Flask (for Render health checks)
+flask==3.0.0
 
-# Note: No PyTorch - Render free tier has 512MB RAM limit
-# Note: No OpenAI package - we're using direct API calls
+# Free TTS (no API key needed!)
+gTTS==2.3.2
