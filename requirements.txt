@@ -1,17 +1,6 @@
-# Core Telegram Bot
 python-telegram-bot==20.7
-
-# HTTP Requests
 requests==2.31.0
-
-# Environment Variables
 python-dotenv==1.0.0
-
-# Google Gemini AI
 google-generativeai==0.3.2
-
-# Flask (for Render health checks)
 flask==3.0.0
-
-# Free TTS (no API key needed!)
 gTTS==2.3.2
