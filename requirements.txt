@@ -1,30 +1,11 @@
 # Core Telegram Bot
 python-telegram-bot==20.7
 
-# AI/LLM APIs
-openai==1.12.0
+# HTTP Requests
 requests==2.31.0
-aiohttp==3.9.1
 
-# Environment & Utils
+# Environment Variables
 python-dotenv==1.0.0
 
-# Audio Processing & TTS
-torch==2.1.2
-torchaudio==2.1.2
-scipy==1.11.4
-
-# FFmpeg wrapper
-ffmpeg-python==0.2.0
-
-# Optional: Audio format conversion
-pydub==0.25.1
-
-# Optional: Language detection (if needed)
-langdetect==1.0.9
-
-# Optional: Faster Whisper (if using local STT)
-# faster-whisper==0.10.0
-
-# Optional: Silero TTS dependencies
-# These are auto-downloaded by torch.hub
+# No PyTorch - Render free tier has 512MB RAM limit
+# No OpenAI package - using direct API calls
