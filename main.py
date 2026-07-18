@@ -12,16 +12,22 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import requests
 import google.generativeai as genai
+from flask import Flask
+from threading import Thread
+from gtts import gTTS
+import subprocess
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (silently fails if .env doesn't exist)
+try:
+    load_dotenv()
+except:
+    pass  # Silently fail on Render
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY")
 
 # Configure Gemini
 if GEMINI_API_KEY:
@@ -34,6 +40,20 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ==================== FLASK WEB SERVER (for Render) ====================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "🤖 IELTS Anger Teacher Bot is running!", 200
+
+@app.route('/health')
+def health_check():
+    return "✅ Alive and angry!", 200
+
+def run_web():
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)), debug=False, use_reloader=False)
 
 # ==================== SYSTEM PROMPT ====================
 IELTS_ANGER_PROMPT = """### CORE PERSONALITY TRAITS
@@ -155,56 +175,53 @@ async def transcribe_audio(audio_path: str):
     
     return None, None
 
-# ==================== TTS FUNCTIONS ====================
-async def generate_tts_google(text: str, lang: str):
-    """Generate speech using Google TTS"""
-    if not GOOGLE_TTS_API_KEY:
-        return None
-    
+# ==================== TTS FUNCTIONS (gTTS - FREE) ====================
+async def generate_tts_gtts(text: str, lang: str):
+    """Generate speech using gTTS (completely free, no API key needed)"""
     if lang not in ["en", "ru"]:
         return None
     
     try:
-        lang_codes = {"en": "en-US", "ru": "ru-RU"}
-        voice_names = {
-            "en": "en-US-Neural2-F",
-            "ru": "ru-RU-Wavenet-A"
-        }
-        
         # Clean text for TTS
         clean_text = text.replace("*", "").replace("_", "").replace("[", "").replace("]", "")
-        clean_text = clean_text[:300]
+        clean_text = clean_text[:300]  # Limit length
         
-        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}"
-        payload = {
-            "input": {"text": clean_text},
-            "voice": {"languageCode": lang_codes[lang], "name": voice_names[lang]},
-            "audioConfig": {"audioEncoding": "OGG_OPUS", "speakingRate": 0.95}
+        # Map language codes for gTTS
+        lang_map = {
+            "en": "en",
+            "ru": "ru"
         }
         
-        response = requests.post(url, json=payload, timeout=30)
+        # Generate speech
+        tts = gTTS(text=clean_text, lang=lang_map[lang], slow=False)
+        output_path = f"/tmp/tts_{datetime.now().timestamp()}.mp3"
+        tts.save(output_path)
         
-        if response.status_code == 200:
-            audio_content = response.json()["audioContent"]
-            output_path = f"/tmp/tts_{datetime.now().timestamp()}.ogg"
-            
-            with open(output_path, "wb") as f:
-                f.write(base64.b64decode(audio_content))
-            
-            return output_path
-        else:
-            logger.error(f"Google TTS error: {response.text}")
-            return None
+        # Convert MP3 to OGG for Telegram
+        ogg_path = output_path.replace(".mp3", ".ogg")
+        subprocess.run([
+            "ffmpeg", "-i", output_path,
+            "-acodec", "libopus", "-b:a", "48k",
+            ogg_path
+        ], capture_output=True)
+        
+        # Clean up MP3
+        try:
+            os.unlink(output_path)
+        except:
+            pass
+        
+        return ogg_path
     except Exception as e:
-        logger.error(f"Google TTS error: {e}")
+        logger.error(f"gTTS error: {e}")
         return None
 
 async def text_to_speech(text: str, lang: str):
-    """Main TTS function"""
-    if not GOOGLE_TTS_API_KEY:
+    """Main TTS function using gTTS"""
+    if lang not in ["en", "ru"]:
         return None
     
-    return await generate_tts_google(text, lang)
+    return await generate_tts_gtts(text, lang)
 
 # ==================== LLM FUNCTIONS ====================
 async def get_llm_response_gemini(text: str, lang: str = "en"):
@@ -259,7 +276,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Gemini AI (brain)\n"
         "• OpenAI Whisper (transcription)\n"
         "• Deepgram (backup STT)\n"
-        "• Google TTS (voice replies)\n\n"
+        "• gTTS (free voice replies)\n\n"
         "⚠️ *Voice replies:* English & Russian only\n"
         "📝 *Uzbek:* Text replies only\n\n"
         "🔊 *Commands:*\n"
@@ -379,13 +396,13 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status.append("✅ OpenAI" if OPENAI_API_KEY else "❌ OpenAI")
     status.append("✅ Gemini" if GEMINI_API_KEY else "❌ Gemini")
     status.append("✅ Deepgram" if DEEPGRAM_API_KEY else "❌ Deepgram")
-    status.append("✅ Google TTS" if GOOGLE_TTS_API_KEY else "❌ Google TTS")
+    status.append("✅ gTTS" if True else "❌ gTTS")  # gTTS always available
     
     await update.message.reply_text(
         f"🤖 *Bot Status:* Alive!\n\n"
         f"{chr(10).join(status)}\n\n"
         f"📝 *Supported:* English, Russian, Uzbek\n"
-        f"🔊 *Voice:* English, Russian\n\n"
+        f"🔊 *Voice:* English, Russian (gTTS - Free)\n\n"
         "*Now leave me alone!*",
         parse_mode="Markdown"
     )
@@ -402,6 +419,9 @@ def main():
     
     logger.info("🚀 Starting IELTS Anger Teacher Bot...")
     
+    # Start Flask web server for Render
+    Thread(target=run_web, daemon=True).start()
+    
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -413,7 +433,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_error_handler(error_handler)
     
-    # Start bot
+    # Start bot - polling mode
+    logger.info("✅ Bot is running on Telegram!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
