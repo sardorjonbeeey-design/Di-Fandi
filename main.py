@@ -309,7 +309,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.info("✅ Voice reply sent (silent mode)")
                 except Exception as e:
                     logger.error(f"Failed to send voice: {e}")
-                    # Silent fail - don't send text
             else:
                 # Try English voice as fallback
                 voice_file = await generate_voice_reply(response_text, "en")
