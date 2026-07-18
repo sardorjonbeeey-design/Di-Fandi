@@ -12,6 +12,7 @@ from flask import Flask
 from threading import Thread
 import edge_tts
 import subprocess
+import asyncio
 
 # ==================== LOAD ENVIRONMENT ====================
 try:
@@ -153,7 +154,7 @@ async def transcribe_audio(audio_path: str):
     """Transcribe using Deepgram"""
     return await transcribe_deepgram(audio_path)
 
-# ==================== TTS FUNCTIONS (Edge TTS) ====================
+# ==================== TTS FUNCTIONS (Edge TTS - FIXED) ====================
 async def generate_voice_reply(text: str, lang: str):
     """Generate emotional voice reply using Edge TTS"""
     if lang not in ["en", "ru"]:
@@ -168,6 +169,7 @@ async def generate_voice_reply(text: str, lang: str):
         
         logger.info(f"🔊 Generating voice: {clean_text[:50]}...")
         
+        # Voice mappings
         voices = {
             "en": "en-US-AriaNeural",
             "ru": "ru-RU-DariyaNeural"
@@ -176,15 +178,25 @@ async def generate_voice_reply(text: str, lang: str):
         voice = voices.get(lang, "en-US-AriaNeural")
         output_path = f"/tmp/voice_{datetime.now().timestamp()}.mp3"
         
+        # Edge TTS - pitch and rate work differently
+        # Use SSML for better control
+        ssml_text = f"""
+        <speak>
+            <prosody rate="+5%" pitch="+2%">
+                {clean_text}
+            </prosody>
+        </speak>
+        """
+        
+        # Create TTS with SSML for emotional effect
         tts = edge_tts.Communicate(
-            text=clean_text,
-            voice=voice,
-            rate="+5%",
-            pitch="+2%"
+            text=ssml_text,
+            voice=voice
         )
         
         await tts.save(output_path)
         
+        # Convert to OGG for Telegram
         ogg_path = output_path.replace(".mp3", ".ogg")
         cmd = [
             "ffmpeg", "-i", output_path,
@@ -201,12 +213,14 @@ async def generate_voice_reply(text: str, lang: str):
             pass
         
         if os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 1000:
+            logger.info(f"✅ Voice file created: {ogg_path}")
             return ogg_path
         else:
+            logger.error("❌ FFmpeg conversion failed")
             return None
             
     except Exception as e:
-        logger.error(f"TTS error: {e}")
+        logger.error(f"❌ TTS error: {e}")
         return None
 
 # ==================== LLM FUNCTIONS ====================
